@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Lab Report Extension",
+  "version": "1.0",
+  "description": "An extension to generate lab reports and log them.",
+  "permissions": [
+    "identity"
+  ],
+  "host_permissions": [
+    "https://docs.googleapis.com/",
+    "https://your-lab-backend.com/api/report-logs"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

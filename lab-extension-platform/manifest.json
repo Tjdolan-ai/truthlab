@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Lab Report Generator Plugin",
+  "version": "1.0",
+  "description": "Generates Google Docs reports from plugin data.",
+  "permissions": [
+    "storage",
+    "identity"
+  ],
+  "host_permissions": [
+    "https://docs.googleapis.com/"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Lab Report Generator"
+  }
+}

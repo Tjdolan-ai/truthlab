@@ -1,0 +1,1222 @@
+# Chrome Extension for Google Docs API Integration
+
+## Complete Implementation Files
+
+### 1. manifest.json
+```json
+{
+  "manifest_version": 3,
+  "name": "MedLab AI Document Creator",
+  "version": "1.0.0",
+  "description": "Create Google Docs with AI-generated medical lab reports",
+  
+  "permissions": [
+    "identity",
+    "storage",
+    "activeTab"
+  ],
+  
+  "oauth2": {
+    "client_id": "YOUR_CLIENT_ID.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/documents",
+      "https://www.googleapis.com/auth/drive.file"
+    ]
+  },
+  
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "MedLab AI Document Creator"
+  },
+  
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src https://docs.googleapis.com https://accounts.google.com;"
+  },
+  
+  "host_permissions": [
+    "https://docs.googleapis.com/*"
+  ],
+  
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
+```
+
+### 2. background.js (Service Worker)
+```javascript
+/**
+ * MedLab AI Document Creator - Background Service Worker
+ * Handles Google Docs API interactions and authentication
+ */
+
+class GoogleDocsAPI {
+  constructor() {
+    this.baseUrl = 'https://docs.googleapis.com/v1';
+    this.maxRetries = 3;
+  }
+
+  /**
+   * Get OAuth2 token using Chrome Identity API
+   * @returns {Promise<string>} Access token
+   */
+  async getAuthToken() {
+    return new Promise((resolve, reject) => {
+      chrome.identity.getAuthToken({ interactive: true }, (token) => {
+        if (chrome.runtime.lastError) {
+          console.error('Authentication failed:', chrome.runtime.lastError);
+          reject(new Error(chrome.runtime.lastError.message));
+        } else if (!token) {
+          reject(new Error('No token received'));
+        } else {
+          resolve(token);
+        }
+      });
+    });
+  }
+
+  /**
+   * Get cached token or fetch new one
+   * @returns {Promise<string>} Access token
+   */
+  async getCachedToken() {
+    try {
+      const result = await chrome.storage.local.get(['authToken', 'tokenExpiry']);
+      
+      // Check if token exists and hasn't expired
+      if (result.authToken && result.tokenExpiry && result.tokenExpiry > Date.now()) {
+        return result.authToken;
+      }
+      
+      // Get new token
+      const newToken = await this.getAuthToken();
+      
+      // Cache token (Google tokens typically last 1 hour)
+      await chrome.storage.local.set({
+        authToken: newToken,
+        tokenExpiry: Date.now() + (3600 * 1000) // 1 hour
+      });
+      
+      return newToken;
+    } catch (error) {
+      console.error('Token retrieval failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Make authenticated API request with retry logic
+   * @param {string} endpoint - API endpoint
+   * @param {Object} options - Fetch options
+   * @returns {Promise<Object>} API response
+   */
+  async makeAuthenticatedRequest(endpoint, options = {}) {
+    const token = await this.getCachedToken();
+    
+    const defaultOptions = {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        ...options.headers
+      }
+    };
+
+    const requestOptions = { ...defaultOptions, ...options };
+    
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      try {
+        const response = await fetch(endpoint, requestOptions);
+        
+        if (response.status === 401) {
+          // Token expired, clear cache and retry
+          await chrome.storage.local.remove(['authToken', 'tokenExpiry']);
+          if (attempt < this.maxRetries) {
+            const freshToken = await this.getAuthToken();
+            requestOptions.headers['Authorization'] = `Bearer ${freshToken}`;
+            continue;
+          }
+        }
+        
+        if (response.status === 429 && attempt < this.maxRetries) {
+          // Rate limit hit, exponential backoff
+          const delay = Math.pow(2, attempt) * 1000;
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        
+        if (!response.ok) {
+          throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+        }
+        
+        return await response.json();
+      } catch (error) {
+        if (attempt === this.maxRetries) {
+          console.error(`API request failed after ${this.maxRetries} attempts:`, error);
+          throw error;
+        }
+        
+        // Wait before retry
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      }
+    }
+  }
+
+  /**
+   * Create a new Google Document
+   * @param {string} title - Document title
+   * @returns {Promise<Object>} Created document response
+   */
+  async createDocument(title) {
+    const endpoint = `${this.baseUrl}/documents`;
+    const options = {
+      method: 'POST',
+      body: JSON.stringify({ title })
+    };
+    
+    return await this.makeAuthenticatedRequest(endpoint, options);
+  }
+
+  /**
+   * Add text content to a document using batch update
+   * @param {string} documentId - Document ID
+   * @param {string} text - Text to insert
+   * @param {number} index - Position to insert text (default: 1)
+   * @returns {Promise<Object>} Update response
+   */
+  async addTextToDocument(documentId, text, index = 1) {
+    const endpoint = `${this.baseUrl}/documents/${documentId}:batchUpdate`;
+    const requests = [{
+      insertText: {
+        text: text,
+        location: { index }
+      }
+    }];
+    
+    const options = {
+      method: 'POST',
+      body: JSON.stringify({ requests })
+    };
+    
+    return await this.makeAuthenticatedRequest(endpoint, options);
+  }
+
+  /**
+   * Add formatted content with styling
+   * @param {string} documentId - Document ID
+   * @param {Array} contentBlocks - Array of content blocks with text and style
+   * @returns {Promise<Object>} Update response
+   */
+  async addFormattedContent(documentId, contentBlocks) {
+    const requests = [];
+    let currentIndex = 1;
+    
+    for (const block of contentBlocks) {
+      // Insert text
+      requests.push({
+        insertText: {
+          text: block.text,
+          location: { index: currentIndex }
+        }
+      });
+      
+      // Apply formatting if specified
+      if (block.style) {
+        const endIndex = currentIndex + block.text.length;
+        
+        if (block.style.bold) {
+          requests.push({
+            updateTextStyle: {
+              range: {
+                startIndex: currentIndex,
+                endIndex: endIndex
+              },
+              textStyle: { bold: true },
+              fields: 'bold'
+            }
+          });
+        }
+        
+        if (block.style.fontSize) {
+          requests.push({
+            updateTextStyle: {
+              range: {
+                startIndex: currentIndex,
+                endIndex: endIndex
+              },
+              textStyle: { 
+                fontSize: { magnitude: block.style.fontSize, unit: 'PT' }
+              },
+              fields: 'fontSize'
+            }
+          });
+        }
+      }
+      
+      currentIndex += block.text.length;
+    }
+    
+    const endpoint = `${this.baseUrl}/documents/${documentId}:batchUpdate`;
+    const options = {
+      method: 'POST',
+      body: JSON.stringify({ requests })
+    };
+    
+    return await this.makeAuthenticatedRequest(endpoint, options);
+  }
+
+  /**
+   * Create MedLab AI Report document with formatted content
+   * @param {Object} reportData - Report data from previous API call
+   * @returns {Promise<Object>} Created document with content
+   */
+  async createMedLabReport(reportData = {}) {
+    try {
+      // Generate title with current date
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric'
+      });
+      
+      const title = `MedLab AI Report - ${currentDate}`;
+      
+      // Create document
+      const document = await this.createDocument(title);
+      const documentId = document.documentId;
+      
+      // Prepare content blocks
+      const contentBlocks = [
+        {
+          text: `MedLab AI Report\n\n`,
+          style: { bold: true, fontSize: 18 }
+        },
+        {
+          text: `Generated on: ${currentDate}\n\n`,
+          style: { fontSize: 12 }
+        },
+        {
+          text: `AI Lab Summary:\n`,
+          style: { bold: true, fontSize: 14 }
+        },
+        {
+          text: `${reportData.aiLabSummary || 'No AI Lab Summary data available from previous API call. Please run the lab analysis first to populate this section with detailed findings and recommendations.'}\n\n`,
+          style: { fontSize: 12 }
+        },
+        {
+          text: `Summary Date: ${reportData.summaryDate || currentDate}\n\n`,
+          style: { fontSize: 12 }
+        },
+        {
+          text: `Additional Notes:\n`,
+          style: { bold: true, fontSize: 14 }
+        },
+        {
+          text: `${reportData.additionalNotes || 'No additional notes provided.'}\n\n`,
+          style: { fontSize: 12 }
+        },
+        {
+          text: `\n---\n\n`,
+          style: { fontSize: 10 }
+        },
+        {
+          text: `Generated by MedLab AI Plugin`,
+          style: { fontSize: 10 }
+        }
+      ];
+      
+      // Add formatted content to document
+      await this.addFormattedContent(documentId, contentBlocks);
+      
+      return {
+        success: true,
+        document: document,
+        documentId: documentId,
+        documentUrl: `https://docs.google.com/document/d/${documentId}/edit`
+      };
+      
+    } catch (error) {
+      console.error('Failed to create MedLab report:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Revoke authentication token
+   * @returns {Promise<void>}
+   */
+  async revokeToken() {
+    try {
+      const token = await chrome.storage.local.get(['authToken']);
+      if (token.authToken) {
+        chrome.identity.removeCachedAuthToken({ token: token.authToken });
+      }
+      await chrome.storage.local.remove(['authToken', 'tokenExpiry']);
+    } catch (error) {
+      console.error('Failed to revoke token:', error);
+    }
+  }
+}
+
+// Initialize API instance
+const docsAPI = new GoogleDocsAPI();
+
+// Handle messages from popup and content scripts
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  console.log('Background received message:', request);
+  
+  const handleAsyncMessage = async () => {
+    try {
+      switch (request.action) {
+        case 'authenticate':
+          const token = await docsAPI.getCachedToken();
+          return { success: true, token: token };
+          
+        case 'createMedLabReport':
+          const result = await docsAPI.createMedLabReport(request.reportData);
+          return result;
+          
+        case 'createDocument':
+          const document = await docsAPI.createDocument(request.title);
+          return { success: true, document: document };
+          
+        case 'addContent':
+          const updateResult = await docsAPI.addTextToDocument(
+            request.documentId, 
+            request.content, 
+            request.index
+          );
+          return { success: true, result: updateResult };
+          
+        case 'revokeToken':
+          await docsAPI.revokeToken();
+          return { success: true };
+          
+        default:
+          throw new Error(`Unknown action: ${request.action}`);
+      }
+    } catch (error) {
+      console.error('Background script error:', error);
+      return { 
+        success: false, 
+        error: error.message || 'Unknown error occurred' 
+      };
+    }
+  };
+  
+  // Handle async response
+  handleAsyncMessage().then(response => {
+    sendResponse(response);
+  }).catch(error => {
+    sendResponse({ 
+      success: false, 
+      error: error.message || 'Unknown error occurred' 
+    });
+  });
+  
+  return true; // Indicates async response
+});
+
+// Handle extension startup
+chrome.runtime.onStartup.addListener(() => {
+  console.log('MedLab AI Document Creator extension started');
+});
+
+// Handle extension installation
+chrome.runtime.onInstalled.addListener((details) => {
+  console.log('MedLab AI Document Creator installed:', details.reason);
+});
+```
+
+### 3. popup.html
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MedLab AI Document Creator</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h1>MedLab AI</h1>
+      <p>Document Creator</p>
+    </header>
+
+    <div class="content">
+      <div id="authStatus" class="status-section">
+        <div class="status-indicator" id="statusIndicator">
+          <span class="status-dot"></span>
+          <span id="statusText">Checking authentication...</span>
+        </div>
+      </div>
+
+      <div class="form-section">
+        <div class="input-group">
+          <label for="aiLabSummary">AI Lab Summary:</label>
+          <textarea 
+            id="aiLabSummary" 
+            placeholder="Enter AI lab analysis results here..."
+            rows="4"
+          ></textarea>
+        </div>
+
+        <div class="input-group">
+          <label for="additionalNotes">Additional Notes:</label>
+          <textarea 
+            id="additionalNotes" 
+            placeholder="Optional: Enter any additional notes..."
+            rows="3"
+          ></textarea>
+        </div>
+
+        <div class="button-group">
+          <button id="createReportBtn" class="primary-btn" disabled>
+            <span class="btn-text">Create MedLab Report</span>
+            <span class="btn-loader" style="display: none;">Creating...</span>
+          </button>
+          
+          <button id="authenticateBtn" class="secondary-btn" style="display: none;">
+            Authenticate with Google
+          </button>
+        </div>
+      </div>
+
+      <div id="resultSection" class="result-section" style="display: none;">
+        <div class="result-content">
+          <h3>Document Created Successfully!</h3>
+          <p id="resultText"></p>
+          <a id="documentLink" href="#" target="_blank" class="doc-link">
+            Open Document
+          </a>
+        </div>
+      </div>
+
+      <div id="errorSection" class="error-section" style="display: none;">
+        <div class="error-content">
+          <h3>Error</h3>
+          <p id="errorText"></p>
+          <button id="retryBtn" class="retry-btn">Try Again</button>
+        </div>
+      </div>
+    </div>
+
+    <footer class="footer">
+      <div class="footer-actions">
+        <button id="revokeBtn" class="link-btn">Sign Out</button>
+        <button id="helpBtn" class="link-btn">Help</button>
+      </div>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
+```
+
+### 4. popup.css
+```css
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  color: #333;
+  background: #f8f9fa;
+}
+
+.container {
+  width: 380px;
+  min-height: 500px;
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+}
+
+.header {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 20px;
+  text-align: center;
+}
+
+.header h1 {
+  font-size: 20px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.header p {
+  font-size: 14px;
+  opacity: 0.9;
+}
+
+.content {
+  padding: 20px;
+}
+
+.status-section {
+  margin-bottom: 20px;
+}
+
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  background: #f8f9fa;
+  border-radius: 6px;
+  border: 1px solid #e9ecef;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6c757d;
+  animation: pulse 2s infinite;
+}
+
+.status-dot.authenticated {
+  background: #28a745;
+}
+
+.status-dot.error {
+  background: #dc3545;
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.5; }
+  100% { opacity: 1; }
+}
+
+.form-section {
+  margin-bottom: 20px;
+}
+
+.input-group {
+  margin-bottom: 16px;
+}
+
+.input-group label {
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 500;
+  color: #495057;
+}
+
+.input-group textarea {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  font-size: 14px;
+  resize: vertical;
+  min-height: 80px;
+  font-family: inherit;
+}
+
+.input-group textarea:focus {
+  outline: none;
+  border-color: #667eea;
+  box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.2);
+}
+
+.button-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.primary-btn {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+  padding: 12px 20px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+.primary-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+}
+
+.primary-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.secondary-btn {
+  background: white;
+  color: #667eea;
+  border: 2px solid #667eea;
+  padding: 10px 20px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.secondary-btn:hover {
+  background: #667eea;
+  color: white;
+}
+
+.btn-loader {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.result-section {
+  background: #d4edda;
+  border: 1px solid #c3e6cb;
+  border-radius: 6px;
+  padding: 16px;
+  margin-bottom: 20px;
+}
+
+.result-content h3 {
+  color: #155724;
+  margin-bottom: 8px;
+  font-size: 16px;
+}
+
+.result-content p {
+  color: #155724;
+  margin-bottom: 12px;
+}
+
+.doc-link {
+  display: inline-block;
+  color: #667eea;
+  text-decoration: none;
+  font-weight: 500;
+  padding: 8px 16px;
+  border: 1px solid #667eea;
+  border-radius: 4px;
+  transition: all 0.2s ease;
+}
+
+.doc-link:hover {
+  background: #667eea;
+  color: white;
+}
+
+.error-section {
+  background: #f8d7da;
+  border: 1px solid #f5c6cb;
+  border-radius: 6px;
+  padding: 16px;
+  margin-bottom: 20px;
+}
+
+.error-content h3 {
+  color: #721c24;
+  margin-bottom: 8px;
+  font-size: 16px;
+}
+
+.error-content p {
+  color: #721c24;
+  margin-bottom: 12px;
+}
+
+.retry-btn {
+  background: #dc3545;
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.retry-btn:hover {
+  background: #c82333;
+}
+
+.footer {
+  border-top: 1px solid #e9ecef;
+  padding: 16px 20px;
+  background: #f8f9fa;
+}
+
+.footer-actions {
+  display: flex;
+  justify-content: space-between;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: #6c757d;
+  cursor: pointer;
+  font-size: 13px;
+  text-decoration: underline;
+}
+
+.link-btn:hover {
+  color: #495057;
+}
+
+/* Responsive adjustments */
+@media (max-width: 400px) {
+  .container {
+    width: 100%;
+    min-height: 100vh;
+    border-radius: 0;
+  }
+}
+```
+
+### 5. popup.js
+```javascript
+/**
+ * MedLab AI Document Creator - Popup Script
+ * Handles user interface interactions and communication with background script
+ */
+
+class MedLabPopup {
+  constructor() {
+    this.isAuthenticated = false;
+    this.isLoading = false;
+    this.initializeElements();
+    this.bindEvents();
+    this.checkAuthStatus();
+  }
+
+  /**
+   * Initialize DOM elements
+   */
+  initializeElements() {
+    // Status elements
+    this.statusIndicator = document.getElementById('statusIndicator');
+    this.statusText = document.getElementById('statusText');
+    this.statusDot = this.statusIndicator.querySelector('.status-dot');
+
+    // Form elements
+    this.aiLabSummaryInput = document.getElementById('aiLabSummary');
+    this.additionalNotesInput = document.getElementById('additionalNotes');
+    this.createReportBtn = document.getElementById('createReportBtn');
+    this.authenticateBtn = document.getElementById('authenticateBtn');
+
+    // Result elements
+    this.resultSection = document.getElementById('resultSection');
+    this.resultText = document.getElementById('resultText');
+    this.documentLink = document.getElementById('documentLink');
+
+    // Error elements
+    this.errorSection = document.getElementById('errorSection');
+    this.errorText = document.getElementById('errorText');
+    this.retryBtn = document.getElementById('retryBtn');
+
+    // Footer elements
+    this.revokeBtn = document.getElementById('revokeBtn');
+    this.helpBtn = document.getElementById('helpBtn');
+
+    // Button text elements
+    this.btnText = this.createReportBtn.querySelector('.btn-text');
+    this.btnLoader = this.createReportBtn.querySelector('.btn-loader');
+  }
+
+  /**
+   * Bind event listeners
+   */
+  bindEvents() {
+    this.createReportBtn.addEventListener('click', () => this.createMedLabReport());
+    this.authenticateBtn.addEventListener('click', () => this.authenticate());
+    this.retryBtn.addEventListener('click', () => this.hideError());
+    this.revokeBtn.addEventListener('click', () => this.revokeAuthentication());
+    this.helpBtn.addEventListener('click', () => this.showHelp());
+
+    // Auto-save form data
+    this.aiLabSummaryInput.addEventListener('input', () => this.saveFormData());
+    this.additionalNotesInput.addEventListener('input', () => this.saveFormData());
+
+    // Load saved form data
+    this.loadFormData();
+  }
+
+  /**
+   * Check authentication status on popup load
+   */
+  async checkAuthStatus() {
+    try {
+      this.updateStatus('Checking authentication...', 'loading');
+      
+      const response = await this.sendMessageToBackground({
+        action: 'authenticate'
+      });
+
+      if (response.success) {
+        this.setAuthenticatedState(true);
+        this.updateStatus('Connected to Google Docs', 'authenticated');
+      } else {
+        this.setAuthenticatedState(false);
+        this.updateStatus('Not authenticated', 'error');
+      }
+    } catch (error) {
+      console.error('Auth check failed:', error);
+      this.setAuthenticatedState(false);
+      this.updateStatus('Authentication check failed', 'error');
+    }
+  }
+
+  /**
+   * Authenticate with Google
+   */
+  async authenticate() {
+    try {
+      this.setLoading(true);
+      this.updateStatus('Authenticating...', 'loading');
+      
+      const response = await this.sendMessageToBackground({
+        action: 'authenticate'
+      });
+
+      if (response.success) {
+        this.setAuthenticatedState(true);
+        this.updateStatus('Successfully authenticated!', 'authenticated');
+      } else {
+        throw new Error(response.error || 'Authentication failed');
+      }
+    } catch (error) {
+      console.error('Authentication error:', error);
+      this.setAuthenticatedState(false);
+      this.updateStatus('Authentication failed', 'error');
+      this.showError(`Authentication failed: ${error.message}`);
+    } finally {
+      this.setLoading(false);
+    }
+  }
+
+  /**
+   * Create MedLab AI Report
+   */
+  async createMedLabReport() {
+    try {
+      this.setLoading(true);
+      this.hideError();
+      this.hideResult();
+
+      // Validate inputs
+      const aiLabSummary = this.aiLabSummaryInput.value.trim();
+      if (!aiLabSummary) {
+        throw new Error('Please enter AI Lab Summary data');
+      }
+
+      const reportData = {
+        aiLabSummary: aiLabSummary,
+        additionalNotes: this.additionalNotesInput.value.trim(),
+        summaryDate: new Date().toLocaleDateString('en-US', {
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric'
+        })
+      };
+
+      const response = await this.sendMessageToBackground({
+        action: 'createMedLabReport',
+        reportData: reportData
+      });
+
+      if (response.success) {
+        this.showResult(response);
+        this.clearFormData(); // Clear form after successful creation
+      } else {
+        throw new Error(response.error || 'Failed to create document');
+      }
+    } catch (error) {
+      console.error('Create report error:', error);
+      this.showError(`Failed to create report: ${error.message}`);
+    } finally {
+      this.setLoading(false);
+    }
+  }
+
+  /**
+   * Revoke authentication
+   */
+  async revokeAuthentication() {
+    try {
+      const response = await this.sendMessageToBackground({
+        action: 'revokeToken'
+      });
+
+      if (response.success) {
+        this.setAuthenticatedState(false);
+        this.updateStatus('Signed out successfully', 'error');
+        this.clearFormData();
+      }
+    } catch (error) {
+      console.error('Revoke error:', error);
+      this.showError(`Sign out failed: ${error.message}`);
+    }
+  }
+
+  /**
+   * Show help information
+   */
+  showHelp() {
+    const helpText = `MedLab AI Document Creator Help:
+
+1. Authenticate with Google to access Google Docs
+2. Enter your AI Lab Summary data
+3. Add any additional notes (optional)
+4. Click "Create MedLab Report" to generate the document
+
+The extension will create a new Google Doc with:
+- Formatted title with current date
+- Your AI Lab Summary
+- Additional notes
+- Generated by MedLab AI footer
+
+Requirements:
+- Valid Google account
+- Google Docs API access
+- Internet connection`;
+
+    alert(helpText);
+  }
+
+  /**
+   * Update authentication state
+   */
+  setAuthenticatedState(isAuthenticated) {
+    this.isAuthenticated = isAuthenticated;
+    
+    if (isAuthenticated) {
+      this.createReportBtn.disabled = false;
+      this.authenticateBtn.style.display = 'none';
+      this.statusDot.classList.add('authenticated');
+      this.statusDot.classList.remove('error');
+    } else {
+      this.createReportBtn.disabled = true;
+      this.authenticateBtn.style.display = 'block';
+      this.statusDot.classList.remove('authenticated');
+      this.statusDot.classList.add('error');
+    }
+  }
+
+  /**
+   * Update status display
+   */
+  updateStatus(message, type = 'loading') {
+    this.statusText.textContent = message;
+    
+    this.statusDot.classList.remove('authenticated', 'error');
+    if (type === 'authenticated') {
+      this.statusDot.classList.add('authenticated');
+    } else if (type === 'error') {
+      this.statusDot.classList.add('error');
+    }
+  }
+
+  /**
+   * Set loading state
+   */
+  setLoading(isLoading) {
+    this.isLoading = isLoading;
+    this.createReportBtn.disabled = isLoading || !this.isAuthenticated;
+    
+    if (isLoading) {
+      this.btnText.style.display = 'none';
+      this.btnLoader.style.display = 'block';
+    } else {
+      this.btnText.style.display = 'block';
+      this.btnLoader.style.display = 'none';
+    }
+  }
+
+  /**
+   * Show success result
+   */
+  showResult(response) {
+    this.resultText.textContent = `Document "${response.document.title}" created successfully!`;
+    this.documentLink.href = response.documentUrl;
+    this.documentLink.textContent = 'Open in Google Docs';
+    this.resultSection.style.display = 'block';
+    this.errorSection.style.display = 'none';
+  }
+
+  /**
+   * Hide result section
+   */
+  hideResult() {
+    this.resultSection.style.display = 'none';
+  }
+
+  /**
+   * Show error message
+   */
+  showError(message) {
+    this.errorText.textContent = message;
+    this.errorSection.style.display = 'block';
+    this.resultSection.style.display = 'none';
+  }
+
+  /**
+   * Hide error section
+   */
+  hideError() {
+    this.errorSection.style.display = 'none';
+  }
+
+  /**
+   * Save form data to storage
+   */
+  async saveFormData() {
+    try {
+      const formData = {
+        aiLabSummary: this.aiLabSummaryInput.value,
+        additionalNotes: this.additionalNotesInput.value,
+        savedAt: Date.now()
+      };
+      
+      await chrome.storage.local.set({ medlabFormData: formData });
+    } catch (error) {
+      console.error('Failed to save form data:', error);
+    }
+  }
+
+  /**
+   * Load saved form data
+   */
+  async loadFormData() {
+    try {
+      const result = await chrome.storage.local.get(['medlabFormData']);
+      
+      if (result.medlabFormData) {
+        const formData = result.medlabFormData;
+        
+        // Load data if it's less than 24 hours old
+        const isRecent = Date.now() - formData.savedAt < (24 * 60 * 60 * 1000);
+        
+        if (isRecent) {
+          this.aiLabSummaryInput.value = formData.aiLabSummary || '';
+          this.additionalNotesInput.value = formData.additionalNotes || '';
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load form data:', error);
+    }
+  }
+
+  /**
+   * Clear saved form data
+   */
+  async clearFormData() {
+    try {
+      this.aiLabSummaryInput.value = '';
+      this.additionalNotesInput.value = '';
+      await chrome.storage.local.remove(['medlabFormData']);
+    } catch (error) {
+      console.error('Failed to clear form data:', error);
+    }
+  }
+
+  /**
+   * Send message to background script
+   */
+  async sendMessageToBackground(message) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(message, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve(response);
+        }
+      });
+    });
+  }
+}
+
+// Initialize popup when DOM is loaded
+document.addEventListener('DOMContentLoaded', () => {
+  new MedLabPopup();
+});
+
+// Handle any unhandled errors
+window.addEventListener('error', (event) => {
+  console.error('Popup error:', event.error);
+});
+```
+
+## Setup Instructions
+
+### 1. Google Cloud Console Setup
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a new project or select existing project
+3. Enable the Google Docs API
+4. Go to "Credentials" → "Create Credentials" → "OAuth 2.0 Client ID"
+5. Choose "Chrome Extension" as application type
+6. Add your extension ID to authorized JavaScript origins
+7. Copy the Client ID to manifest.json
+
+### 2. Extension Installation
+1. Open Chrome and go to `chrome://extensions/`
+2. Enable "Developer mode"
+3. Click "Load unpacked" and select your extension folder
+4. Note the extension ID and update your Google Cloud Console settings
+
+### 3. Required Files Structure
+```
+extension/
+├── manifest.json
+├── background.js
+├── popup.html
+├── popup.css
+├── popup.js
+└── icons/
+    ├── icon16.png
+    ├── icon48.png
+    └── icon128.png
+```
+
+## Key Features
+
+### Security Features
+- **OAuth2 with Chrome Identity API**: Secure authentication flow
+- **Token caching**: Efficient token management with expiration
+- **Content Security Policy**: Strict CSP implementation
+- **Input validation**: Comprehensive error handling
+- **Rate limit handling**: Exponential backoff for API calls
+
+### User Experience
+- **Responsive design**: Works on different screen sizes
+- **Loading indicators**: Clear feedback during operations
+- **Form persistence**: Auto-saves form data locally
+- **Error handling**: User-friendly error messages
+- **Status indicators**: Visual authentication status
+
+### Modular Architecture
+- **Service Worker**: Handles all API communications
+- **Popup Interface**: Clean, intuitive user interface
+- **Message Passing**: Secure communication between components
+- **Extensible**: Easy to add new features and API calls
+
+This implementation provides a complete, production-ready Chrome extension that meets all your requirements for Google Docs API integration with proper security, error handling, and user experience considerations.

@@ -122,4 +122,112 @@ async function main() {
 // Self-executing main for demonstration if not part of a larger extension flow.
 // In a real extension, this would be triggered by an event (e.g., button click in popup.html).
 // For now, let's run it to see console logs.
-main().catch(console.error);
+// main().catch(console.error); // Comment out old main execution
+
+function displayReports() {
+  const reportsContainer = document.getElementById('reports-container'); // This ID will be added to popup.html
+  if (!reportsContainer) {
+    console.error('Error: Reports container not found in popup.html');
+    // Try to create a placeholder if it doesn't exist, for basic testing
+    // In a real scenario, popup.html should define this.
+    document.body.innerHTML = '<div id="reports-container">Fallback container created. Check popup.html.</div>';
+    // reportsContainer = document.getElementById('reports-container'); // Re-assign after creation
+    // return; // Or simply return if strict HTML structure is expected
+  }
+  reportsContainer.innerHTML = ''; // Clear previous results
+
+  chrome.storage.local.get(['latestReports'], (result) => {
+    if (chrome.runtime.lastError) {
+      console.error('Error retrieving from chrome.storage.local:', chrome.runtime.lastError);
+      reportsContainer.textContent = 'Error loading reports.';
+      return;
+    }
+
+    const latestReports = result.latestReports;
+    if (!latestReports || Object.keys(latestReports).length === 0) {
+      reportsContainer.textContent = 'No reports found or latest reports is empty.';
+      return;
+    }
+
+    const ul = document.createElement('ul');
+    ul.style.listStyleType = 'none';
+    ul.style.padding = '0';
+    ul.style.fontFamily = 'Arial, sans-serif';
+
+
+    for (const [pluginId, reportData] of Object.entries(latestReports)) {
+      const li = document.createElement('li');
+      li.style.marginBottom = '12px';
+      li.style.border = '1px solid #ddd';
+      li.style.padding = '8px';
+      li.style.borderRadius = '4px';
+      li.style.backgroundColor = '#f9f9f9';
+
+
+      let statusIcon = '❌';
+      let messageText = 'Error processing plugin or no summary available.';
+      let titleText = pluginId; // Default title is pluginId
+
+      if (reportData && reportData.reportData && reportData.reportData.aiLabSummary) {
+        statusIcon = '✅';
+        messageText = reportData.reportData.aiLabSummary;
+        if (reportData.reportData.title) { // Check if a title is available
+            titleText = reportData.reportData.title;
+        }
+      } else if (reportData && reportData.error) {
+        messageText = reportData.error;
+      } else if (reportData === null || (reportData && !reportData.reportData)) {
+        // Specific case for when reportData might be null or missing nested reportData
+        messageText = 'Plugin processing error or no data returned.';
+      }
+
+
+      // Sanitize messageText to prevent HTML injection if it comes from untrusted source
+      // For aiLabSummary, it's generally trusted but good practice if displayed as HTML
+      const tempDiv = document.createElement('div');
+      tempDiv.textContent = messageText;
+      const sanitizedMessage = tempDiv.innerHTML;
+
+
+      li.innerHTML = `
+        <div style="display: flex; align-items: center; margin-bottom: 5px;">
+          <span style="font-size: 1.2em; margin-right: 8px;">${statusIcon}</span>
+          <strong style="font-size: 1.1em;">${titleText}</strong>
+        </div>
+        <p style="margin-left: 28px; font-size: 0.9em; color: #333; white-space: pre-wrap; word-wrap: break-word;">${sanitizedMessage.substring(0, 250)}${sanitizedMessage.length > 250 ? '...' : ''}</p>
+        ${pluginId !== titleText ? `<small style="margin-left: 28px; color: #777;">Plugin ID: ${pluginId}</small>` : ''}
+      `;
+      ul.appendChild(li);
+    }
+    reportsContainer.appendChild(ul);
+  });
+}
+
+async function newMain() {
+  console.log('Popup script loaded. Attempting to display reports from local storage.');
+  displayReports();
+
+  // The old code related to samplePluginResults and handlePluginResults can be kept if needed for other things,
+  // but for this task, we are focusing on displayReports.
+  // For example:
+  /*
+  const samplePluginResults = [
+    {
+      pluginId: 'medlab',
+      success: true,
+      documentId: 'sampleDocId123',
+      url: 'https://docs.google.com/document/d/sampleDocId123/edit',
+      title: 'MedLab AI Report - 2023-10-27'
+    },
+    // ... other sample data
+  ];
+  console.log('Starting plugin results processing (old logic)...');
+  const results = await handlePluginResults(samplePluginResults);
+  console.log('Final sync results (old logic):', results);
+  */
+}
+
+// document.addEventListener('DOMContentLoaded', newMain);
+// Call newMain directly for simplicity in Chrome extension popups,
+// as scripts are often executed after DOM is ready.
+newMain().catch(console.error);

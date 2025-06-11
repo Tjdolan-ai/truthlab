@@ -41,6 +41,15 @@ async function performDraftEnrichment() {
     // This variable 'updatedDraftsMap' is the required output.
     // If this were triggered by a message, this map could be part of the response.
 
+    // Store results in chrome.storage.local
+    chrome.storage.local.set({ latestReports: updatedDraftsMap }, () => {
+      if (chrome.runtime.lastError) {
+        console.error('Error saving to chrome.storage.local:', chrome.runtime.lastError);
+      } else {
+        console.log('Successfully saved latestReports to chrome.storage.local.');
+      }
+    });
+
   } catch (error) {
     console.error('Background: An error occurred during the draft enrichment process:', error);
   }

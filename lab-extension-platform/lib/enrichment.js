@@ -151,21 +151,36 @@ export async function enrichAllPluginDrafts(readyPlugins) {
       continue;
     }
     const pluginId = plugin.id;
+    let success = false;
+    let errorMessage = null;
+    let enrichedDraftResult = null;
+
     try {
-      const enrichedDraft = await enrichPluginDraft(pluginId);
-      if (enrichedDraft) { // Could be original or updated draft
-        updatedDrafts.set(pluginId, enrichedDraft);
+      enrichedDraftResult = await enrichPluginDraft(pluginId);
+      if (enrichedDraftResult) { // Could be original or updated draft
+        updatedDrafts.set(pluginId, enrichedDraftResult);
+        success = true;
       } else {
         // If enrichPluginDraft returned null (e.g. no draft found, error)
-        // We might still want to set it to null or skip adding it to the map.
-        // For now, let's add it as null to indicate it was processed.
         updatedDrafts.set(pluginId, null);
+        success = false;
+        errorMessage = `Plugin ${pluginId}: Enrichment process resulted in null or no changes (e.g., no draft found or internal error during enrichment).`;
         console.log(`No draft or error for plugin ${pluginId}, result set to null in map.`);
       }
     } catch (error) {
       console.error(`Unhandled error during enrichment for plugin ${pluginId}:`, error);
       updatedDrafts.set(pluginId, null); // Indicate failure for this plugin
+      success = false;
+      errorMessage = error.message;
     }
+
+    const metadata = {
+      pluginId: pluginId,
+      timestamp: new Date().toISOString(),
+      success: success,
+      errorMessage: errorMessage,
+    };
+    await logReportMetadata(pluginId, metadata);
   }
 
   console.log('Finished enrichment process for all plugins.');
@@ -175,4 +190,43 @@ export async function enrichAllPluginDrafts(readyPlugins) {
 export default {
   enrichPluginDraft,
   enrichAllPluginDrafts,
+  logReportMetadata,
 };
+
+// --- New function logReportMetadata added below ---
+
+export async function logReportMetadata(pluginId, metadata) {
+  if (!chrome.storage || !chrome.storage.local) {
+    console.error('chrome.storage.local is not available. Cannot log report metadata.');
+    return;
+  }
+
+  const storageKey = 'reportLogs';
+  let logs = [];
+
+  try {
+    const result = await chrome.storage.local.get([storageKey]);
+    if (chrome.runtime.lastError) {
+      console.error(`Error retrieving report logs for ${pluginId}: ${chrome.runtime.lastError.message}`);
+      // Potentially return or decide not to overwrite logs if retrieval fails significantly
+    } else if (result && result[storageKey] && Array.isArray(result[storageKey])) {
+      logs = result[storageKey];
+    }
+  } catch (error) {
+    console.error(`Exception while retrieving report logs for ${pluginId}: ${error}`);
+    // Potentially return or decide not to overwrite logs
+  }
+
+  logs.push(metadata); // Add the new log entry
+
+  try {
+    await chrome.storage.local.set({ [storageKey]: logs });
+    if (chrome.runtime.lastError) {
+      console.error(`Error saving report logs for ${pluginId}: ${chrome.runtime.lastError.message}`);
+    } else {
+      console.log(`Report metadata for ${pluginId} logged successfully. Total logs: ${logs.length}`);
+    }
+  } catch (error) {
+    console.error(`Exception while saving report logs for ${pluginId}: ${error}`);
+  }
+}
